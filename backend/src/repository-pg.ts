@@ -1,5 +1,6 @@
 import { Pool } from "pg";
 import {
+  BatchMatchRewardInput,
   GameMode,
   GameServer,
   HeartbeatInput,
@@ -15,8 +16,12 @@ import {
   Player,
   PlayerProfile,
   RegisterServerInput,
+  ScriptPackage,
+  ScriptPackageFile,
   ShopItem,
   TravelReservation,
+  UpsertScriptPackageFileInput,
+  UpsertScriptPackageInput,
   UpsertShopItemInput,
 } from "./domain.js";
 import { RepositoryError } from "./repository-memory.js";
@@ -572,6 +577,84 @@ export class PgOpenVibeRepository implements OpenVibeRepository {
     return this.getProfile(input.steamId);
   }
 
+  async recordBatchMatchRewards(input: BatchMatchRewardInput): Promise<PlayerProfile[] | null> {
+    const client = await this.pool.connect();
+    const rewarded: string[] = [];
+
+    try {
+      await client.query("BEGIN");
+
+      const serverResult = await client.query(
+        "SELECT 1 FROM game_servers WHERE server_id = $1 AND server_secret = $2",
+        [input.serverId, input.serverSecret],
+      );
+      if (serverResult.rowCount !== 1) {
+        await client.query("COMMIT");
+        return null;
+      }
+
+      for (const entry of input.results) {
+        const inserted = await client.query(
+          `
+          INSERT INTO match_results (
+            match_id, server_id, steam_id, mode, reward_currency, reward_xp, stats
+          )
+          VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+          ON CONFLICT (match_id, steam_id) DO NOTHING
+          RETURNING result_id
+          `,
+          [
+            input.matchId,
+            input.serverId,
+            entry.steamId,
+            input.mode,
+            entry.rewardCurrency,
+            entry.rewardXp,
+            JSON.stringify(entry.stats ?? {}),
+          ],
+        );
+
+        if (inserted.rowCount === 1) {
+          await client.query(
+            `
+            UPDATE players
+            SET currency_balance = currency_balance + $2,
+                xp = xp + $3,
+                updated_at = now()
+            WHERE steam_id = $1
+            `,
+            [entry.steamId, entry.rewardCurrency, entry.rewardXp],
+          );
+
+          await client.query(
+            `
+            INSERT INTO currency_ledger (steam_id, delta, reason, idempotency_key)
+            VALUES ($1, $2, 'match_reward', $3)
+            ON CONFLICT DO NOTHING
+            `,
+            [entry.steamId, entry.rewardCurrency, `match:${input.matchId}:${entry.steamId}`],
+          );
+
+          rewarded.push(entry.steamId);
+        }
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    const profiles: PlayerProfile[] = [];
+    for (const steamId of rewarded) {
+      const profile = await this.getProfile(steamId);
+      if (profile) profiles.push(profile);
+    }
+    return profiles;
+  }
+
   async getLeaderboard(options: { limit: number; mode?: GameMode }): Promise<LeaderboardEntry[]> {
     const result = await this.pool.query(
       `
@@ -648,6 +731,98 @@ export class PgOpenVibeRepository implements OpenVibeRepository {
       [options.limit],
     );
     return result.rows.map(mapAuditEvent);
+  }
+
+  async listScriptPackages(): Promise<ScriptPackage[]> {
+    const result = await this.pool.query(
+      `SELECT package_id, package_type, display_name, description, version,
+              author_steam_id, manifest_json, trusted, enabled, created_at, updated_at
+       FROM script_packages
+       ORDER BY created_at ASC`,
+    );
+    return result.rows.map(mapScriptPackage);
+  }
+
+  async getScriptPackage(packageId: string): Promise<ScriptPackage | null> {
+    const result = await this.pool.query(
+      `SELECT package_id, package_type, display_name, description, version,
+              author_steam_id, manifest_json, trusted, enabled, created_at, updated_at
+       FROM script_packages WHERE package_id = $1`,
+      [packageId],
+    );
+    return result.rows[0] ? mapScriptPackage(result.rows[0]) : null;
+  }
+
+  async upsertScriptPackage(input: UpsertScriptPackageInput): Promise<ScriptPackage> {
+    const result = await this.pool.query(
+      `
+      INSERT INTO script_packages
+        (package_id, package_type, display_name, description, version, author_steam_id, manifest_json, trusted)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (package_id) DO UPDATE SET
+        package_type    = EXCLUDED.package_type,
+        display_name    = EXCLUDED.display_name,
+        description     = EXCLUDED.description,
+        version         = EXCLUDED.version,
+        author_steam_id = EXCLUDED.author_steam_id,
+        manifest_json   = EXCLUDED.manifest_json,
+        trusted         = EXCLUDED.trusted,
+        updated_at      = now()
+      RETURNING package_id, package_type, display_name, description, version,
+                author_steam_id, manifest_json, trusted, enabled, created_at, updated_at
+      `,
+      [
+        input.packageId,
+        input.packageType,
+        input.displayName,
+        input.description,
+        input.version,
+        input.authorSteamId ?? null,
+        JSON.stringify(input.manifestJson ?? {}),
+        input.trusted ?? false,
+      ],
+    );
+    return mapScriptPackage(result.rows[0]);
+  }
+
+  async listScriptPackageFiles(packageId: string): Promise<ScriptPackageFile[]> {
+    const result = await this.pool.query(
+      `SELECT package_id, path, sha256, size_bytes, realm, content, created_at
+       FROM script_package_files
+       WHERE package_id = $1
+       ORDER BY path`,
+      [packageId],
+    );
+    return result.rows.map(mapScriptPackageFile);
+  }
+
+  async upsertScriptPackageFile(input: UpsertScriptPackageFileInput): Promise<ScriptPackageFile> {
+    const result = await this.pool.query(
+      `
+      INSERT INTO script_package_files (package_id, path, sha256, size_bytes, realm, content)
+      VALUES ($1, $2, $3, $4, $5, $6)
+      ON CONFLICT (package_id, path) DO UPDATE SET
+        sha256     = EXCLUDED.sha256,
+        size_bytes = EXCLUDED.size_bytes,
+        realm      = EXCLUDED.realm,
+        content    = EXCLUDED.content
+      RETURNING package_id, path, sha256, size_bytes, realm, content, created_at
+      `,
+      [input.packageId, input.path, input.sha256, input.sizeBytes, input.realm, input.content],
+    );
+    return mapScriptPackageFile(result.rows[0]);
+  }
+
+  async setScriptPackageEnabled(packageId: string, enabled: boolean): Promise<ScriptPackage | null> {
+    const result = await this.pool.query(
+      `UPDATE script_packages
+       SET enabled = $2, updated_at = now()
+       WHERE package_id = $1
+       RETURNING package_id, package_type, display_name, description, version,
+                 author_steam_id, manifest_json, trusted, enabled, created_at, updated_at`,
+      [packageId, enabled],
+    );
+    return result.rows[0] ? mapScriptPackage(result.rows[0]) : null;
   }
 }
 
@@ -731,6 +906,34 @@ function mapAuditEvent(row: Record<string, unknown>): AuditEvent {
     action: String(row.action),
     targetSteamId: row.target_steam_id ? String(row.target_steam_id) : null,
     reason: String(row.reason),
+    createdAt: new Date(row.created_at as string | Date).toISOString(),
+  };
+}
+
+function mapScriptPackage(row: Record<string, unknown>): ScriptPackage {
+  return {
+    packageId: String(row.package_id),
+    packageType: row.package_type as ScriptPackage["packageType"],
+    displayName: String(row.display_name),
+    description: String(row.description),
+    version: String(row.version),
+    authorSteamId: row.author_steam_id ? String(row.author_steam_id) : null,
+    manifestJson: (row.manifest_json ?? {}) as Record<string, unknown>,
+    trusted: Boolean(row.trusted),
+    enabled: Boolean(row.enabled),
+    createdAt: new Date(row.created_at as string | Date).toISOString(),
+    updatedAt: new Date(row.updated_at as string | Date).toISOString(),
+  };
+}
+
+function mapScriptPackageFile(row: Record<string, unknown>): ScriptPackageFile {
+  return {
+    packageId: String(row.package_id),
+    path: String(row.path),
+    sha256: String(row.sha256),
+    sizeBytes: Number(row.size_bytes),
+    realm: row.realm as ScriptPackageFile["realm"],
+    content: String(row.content),
     createdAt: new Date(row.created_at as string | Date).toISOString(),
   };
 }

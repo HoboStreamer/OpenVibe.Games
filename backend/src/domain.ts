@@ -4,7 +4,62 @@ export type GameMode = (typeof modes)[number];
 
 export type ServerState = "starting" | "open" | "full" | "ending" | "offline";
 
-export type ItemType = "player_model" | "trail" | "nameplate";
+export type ItemType =
+  | "player_model"
+  | "trail"
+  | "nameplate"
+  | "title"
+  | "spray"
+  | "emote"
+  | "fortwars_part"
+  | "traitortown_cosmetic";
+
+export type PackageType = "gamemode" | "addon" | "library";
+export type PackageRealm = "server" | "client" | "shared";
+
+export interface ScriptPackage {
+  packageId: string;
+  packageType: PackageType;
+  displayName: string;
+  description: string;
+  version: string;
+  authorSteamId: string | null;
+  manifestJson: Record<string, unknown>;
+  trusted: boolean;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScriptPackageFile {
+  packageId: string;
+  path: string;
+  sha256: string;
+  sizeBytes: number;
+  realm: PackageRealm;
+  content: string;
+  createdAt: string;
+}
+
+export interface UpsertScriptPackageInput {
+  packageId: string;
+  packageType: PackageType;
+  displayName: string;
+  description: string;
+  version: string;
+  authorSteamId?: string | null;
+  manifestJson?: Record<string, unknown>;
+  trusted?: boolean;
+}
+
+export interface UpsertScriptPackageFileInput {
+  packageId: string;
+  path: string;
+  sha256: string;
+  sizeBytes: number;
+  realm: PackageRealm;
+  content: string;
+}
 
 export interface Player {
   steamId: string;
@@ -139,6 +194,19 @@ export interface MatchRewardInput {
   stats?: Record<string, unknown>;
 }
 
+export interface BatchMatchRewardInput {
+  matchId: string;
+  serverId: string;
+  serverSecret: string;
+  mode: GameMode;
+  results: Array<{
+    steamId: string;
+    rewardCurrency: number;
+    rewardXp: number;
+    stats?: Record<string, unknown>;
+  }>;
+}
+
 export interface UpsertShopItemInput {
   itemId: string;
   itemType: ItemType;
@@ -178,6 +246,7 @@ export interface OpenVibeRepository {
     serverId: string;
   }): Promise<JoinTokenValidation>;
   recordMatchReward(input: MatchRewardInput): Promise<PlayerProfile | null>;
+  recordBatchMatchRewards(input: BatchMatchRewardInput): Promise<PlayerProfile[] | null>;
   getLeaderboard(options: { limit: number; mode?: GameMode }): Promise<LeaderboardEntry[]>;
   upsertShopItem(input: UpsertShopItemInput): Promise<ShopItem>;
   recordAuditEvent(input: {
@@ -187,4 +256,12 @@ export interface OpenVibeRepository {
     reason: string;
   }): Promise<AuditEvent>;
   listAuditEvents(options: { limit: number }): Promise<AuditEvent[]>;
+
+  // Script packages
+  listScriptPackages(): Promise<ScriptPackage[]>;
+  getScriptPackage(packageId: string): Promise<ScriptPackage | null>;
+  listScriptPackageFiles(packageId: string): Promise<ScriptPackageFile[]>;
+  upsertScriptPackage(input: UpsertScriptPackageInput): Promise<ScriptPackage>;
+  upsertScriptPackageFile(input: UpsertScriptPackageFileInput): Promise<ScriptPackageFile>;
+  setScriptPackageEnabled(packageId: string, enabled: boolean): Promise<ScriptPackage | null>;
 }

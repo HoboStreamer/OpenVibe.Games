@@ -8,6 +8,7 @@ import {
   acceptPartyInviteSchema,
   auditEventSchema,
   auditQuerySchema,
+  batchMatchEndSchema,
   buyItemSchema,
   createPartySchema,
   equipItemSchema,
@@ -17,10 +18,13 @@ import {
   leaderboardQuerySchema,
   listServersQuerySchema,
   matchEndSchema,
+  packageIdParamSchema,
   partyInviteSchema,
   partyTravelSchema,
   registerServerSchema,
   travelRequestSchema,
+  upsertScriptPackageFileSchema,
+  upsertScriptPackageSchema,
   upsertShopItemSchema,
   validateJoinTokenSchema,
 } from "./schemas.js";
@@ -94,6 +98,31 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
       sessionToken,
       ...profile,
     };
+  });
+
+  app.get("/v1/auth/session", async (request, reply) => {
+    const authHeader = (request.headers["authorization"] ?? "") as string;
+    if (!authHeader.startsWith("Bearer ")) {
+      return reply.code(401).send({ error: "missing_token" });
+    }
+    const token = authHeader.slice(7).trim();
+    if (!token) {
+      return reply.code(401).send({ error: "missing_token" });
+    }
+
+    if (options.sessionStore?.getSession) {
+      const session = await options.sessionStore.getSession(token);
+      if (!session) return reply.code(401).send({ error: "invalid_token" });
+      return { valid: true, steamId: session.steamId, provider: session.provider };
+    }
+
+    // Fallback when no session store is configured: parse steamId from token format.
+    const parts = token.split(".");
+    if (parts.length >= 3 && (parts[0] === "dev" || parts[0] === "steam")) {
+      return { valid: true, provider: parts[0] as "dev" | "steam", steamId: parts[1] };
+    }
+
+    return reply.code(401).send({ error: "invalid_token" });
   });
 
   app.post("/v1/auth/steam", async (request, reply) => {
@@ -274,6 +303,13 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     return profile;
   });
 
+  app.post("/v1/matches/end/batch", async (request, reply) => {
+    const body = batchMatchEndSchema.parse(request.body);
+    const profiles = await options.repository.recordBatchMatchRewards(body);
+    if (profiles === null) return reply.code(403).send({ error: "invalid_server_secret" });
+    return { rewarded: profiles.length, profiles };
+  });
+
   // GET /v1/leaderboard?limit=10&mode=prophunt
   app.get("/v1/leaderboard", async (request) => {
     const query = leaderboardQuerySchema.parse(request.query);
@@ -303,6 +339,56 @@ export async function createApp(options: AppOptions): Promise<FastifyInstance> {
     if (!requireAdmin(request, reply)) return;
     const query = auditQuerySchema.parse(request.query);
     return { events: await options.repository.listAuditEvents(query) };
+  });
+
+  // Script packages
+  app.get("/v1/scripts/packages", async () => {
+    return { packages: await options.repository.listScriptPackages() };
+  });
+
+  app.get("/v1/scripts/packages/:packageId", async (request, reply) => {
+    const { packageId } = packageIdParamSchema.parse(request.params);
+    const pkg = await options.repository.getScriptPackage(packageId);
+    if (!pkg) return reply.code(404).send({ error: "not_found" });
+    return pkg;
+  });
+
+  app.get("/v1/scripts/packages/:packageId/files", async (request, reply) => {
+    const { packageId } = packageIdParamSchema.parse(request.params);
+    const pkg = await options.repository.getScriptPackage(packageId);
+    if (!pkg) return reply.code(404).send({ error: "not_found" });
+    return { files: await options.repository.listScriptPackageFiles(packageId) };
+  });
+
+  app.post("/v1/admin/scripts/packages", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const body = upsertScriptPackageSchema.parse(request.body);
+    return options.repository.upsertScriptPackage(body);
+  });
+
+  app.post("/v1/admin/scripts/packages/:packageId/files", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const { packageId } = packageIdParamSchema.parse(request.params);
+    const body = upsertScriptPackageFileSchema.parse(request.body);
+    const pkg = await options.repository.getScriptPackage(packageId);
+    if (!pkg) return reply.code(404).send({ error: "package_not_found" });
+    return options.repository.upsertScriptPackageFile({ ...body, packageId });
+  });
+
+  app.post("/v1/admin/scripts/packages/:packageId/enable", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const { packageId } = packageIdParamSchema.parse(request.params);
+    const pkg = await options.repository.setScriptPackageEnabled(packageId, true);
+    if (!pkg) return reply.code(404).send({ error: "not_found" });
+    return pkg;
+  });
+
+  app.post("/v1/admin/scripts/packages/:packageId/disable", async (request, reply) => {
+    if (!requireAdmin(request, reply)) return;
+    const { packageId } = packageIdParamSchema.parse(request.params);
+    const pkg = await options.repository.setScriptPackageEnabled(packageId, false);
+    if (!pkg) return reply.code(404).send({ error: "not_found" });
+    return pkg;
   });
 
   app.get("/metrics", async (_request, reply) => {

@@ -1,5 +1,6 @@
 import { nanoid } from "nanoid";
 import {
+  BatchMatchRewardInput,
   GameMode,
   GameServer,
   HeartbeatInput,
@@ -15,8 +16,12 @@ import {
   Player,
   PlayerProfile,
   RegisterServerInput,
+  ScriptPackage,
+  ScriptPackageFile,
   ShopItem,
   TravelReservation,
+  UpsertScriptPackageFileInput,
+  UpsertScriptPackageInput,
   UpsertShopItemInput,
 } from "./domain.js";
 
@@ -71,6 +76,8 @@ export class MemoryOpenVibeRepository implements OpenVibeRepository {
   private invites = new Map<string, PartyInvite>();
   private auditEvents: AuditEvent[] = [];
   private rewardKeys = new Set<string>();
+  private scriptPackages = new Map<string, ScriptPackage>();
+  private scriptPackageFiles = new Map<string, ScriptPackageFile[]>();
 
   async upsertDevPlayer(input: { steamId: string; displayName: string }): Promise<PlayerProfile> {
     const existing = this.players.get(input.steamId);
@@ -348,6 +355,27 @@ export class MemoryOpenVibeRepository implements OpenVibeRepository {
     return this.profileFor(input.steamId);
   }
 
+  async recordBatchMatchRewards(input: BatchMatchRewardInput): Promise<PlayerProfile[] | null> {
+    const server = this.servers.get(input.serverId);
+    if (!server || server.serverSecret !== input.serverSecret) return null;
+
+    const profiles: PlayerProfile[] = [];
+    for (const entry of input.results) {
+      const player = this.players.get(entry.steamId);
+      if (!player) continue;
+
+      const key = `${input.matchId}:${entry.steamId}`;
+      if (!this.rewardKeys.has(key)) {
+        player.currencyBalance += entry.rewardCurrency;
+        player.xp += entry.rewardXp;
+        this.rewardKeys.add(key);
+        profiles.push(this.profileFor(entry.steamId));
+      }
+    }
+
+    return profiles;
+  }
+
   private profileFor(steamId: string): PlayerProfile {
     const player = this.requirePlayer(steamId);
     const owned = this.ensureInventory(steamId);
@@ -459,6 +487,61 @@ export class MemoryOpenVibeRepository implements OpenVibeRepository {
 
   async listAuditEvents(options: { limit: number }): Promise<AuditEvent[]> {
     return this.auditEvents.slice(0, options.limit).map((event) => ({ ...event }));
+  }
+
+  async listScriptPackages(): Promise<ScriptPackage[]> {
+    return Array.from(this.scriptPackages.values()).map((p) => ({ ...p }));
+  }
+
+  async getScriptPackage(packageId: string): Promise<ScriptPackage | null> {
+    const pkg = this.scriptPackages.get(packageId);
+    return pkg ? { ...pkg } : null;
+  }
+
+  async upsertScriptPackage(input: UpsertScriptPackageInput): Promise<ScriptPackage> {
+    const now = new Date().toISOString();
+    const existing = this.scriptPackages.get(input.packageId);
+    const pkg: ScriptPackage = {
+      packageId: input.packageId,
+      packageType: input.packageType,
+      displayName: input.displayName,
+      description: input.description,
+      version: input.version,
+      authorSteamId: input.authorSteamId ?? null,
+      manifestJson: input.manifestJson ?? {},
+      trusted: input.trusted ?? false,
+      enabled: existing?.enabled ?? false,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    this.scriptPackages.set(pkg.packageId, pkg);
+    return { ...pkg };
+  }
+
+  async listScriptPackageFiles(packageId: string): Promise<ScriptPackageFile[]> {
+    return (this.scriptPackageFiles.get(packageId) ?? []).map((f) => ({ ...f }));
+  }
+
+  async upsertScriptPackageFile(input: UpsertScriptPackageFileInput): Promise<ScriptPackageFile> {
+    const now = new Date().toISOString();
+    const file: ScriptPackageFile = { ...input, createdAt: now };
+    const files = this.scriptPackageFiles.get(input.packageId) ?? [];
+    const idx = files.findIndex((f) => f.path === input.path);
+    if (idx >= 0) {
+      files[idx] = file;
+    } else {
+      files.push(file);
+    }
+    this.scriptPackageFiles.set(input.packageId, files);
+    return { ...file };
+  }
+
+  async setScriptPackageEnabled(packageId: string, enabled: boolean): Promise<ScriptPackage | null> {
+    const pkg = this.scriptPackages.get(packageId);
+    if (!pkg) return null;
+    const updated: ScriptPackage = { ...pkg, enabled, updatedAt: new Date().toISOString() };
+    this.scriptPackages.set(packageId, updated);
+    return { ...updated };
   }
 }
 
